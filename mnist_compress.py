@@ -9,63 +9,8 @@ import time
 import argparse
 from tqdm import tqdm
 import pickle
+from utils.ans import NORM_CONST, ANS, VectorizedANS as ANS
 
-class ANS:
-    def __init__(self, pmfs, bits=31, quantbits=8):
-        self.device = pmfs.device
-        self.bits = bits
-        self.quantbits = quantbits
-
-        # mask of 2**bits - 1 bits
-        self.mask = (1 << bits) - 1
-
-        # normalization constants
-        self.lbound = 1 << 32
-        self.tail_bits = (1 << 32) - 1
-
-        self.seq_len, self.support = pmfs.shape
-
-        # compute pmf's and cdf's scaled up by 2**n
-        multiplier = (1 << self.bits) - (1 << self.quantbits)
-        self.pmfs = (pmfs * multiplier).long()
-
-        # add ones to counter zero probabilities
-        self.pmfs += torch.ones_like(self.pmfs)
-
-        # add remnant to the maximum value of the probabilites
-        self.pmfs[torch.arange(0, self.seq_len),torch.argmax(self.pmfs, dim=1)] += ((1 << self.bits) - self.pmfs.sum(1))
-
-        # compute cdf's
-        self.cdfs = torch.cumsum(self.pmfs, dim=1) # compute CDF (scaled up to 2**n)
-        self.cdfs = torch.cat([torch.zeros([self.cdfs.shape[0], 1], dtype=torch.long, device=self.device), self.cdfs], dim=1) # pad with 0 at the beginning
-
-        # move cdf's and pmf's the cpu for faster encoding and decoding
-        self.cdfs = self.cdfs.cpu().numpy()
-        self.pmfs = self.pmfs.cpu().numpy()
-
-        assert self.cdfs.shape == (self.seq_len, self.support + 1)
-        assert np.all(self.cdfs[:,-1] == (1 << bits))
-
-    def encode(self, x, symbols):
-        for i, s in enumerate(symbols):
-            pmf = int(self.pmfs[i,s])
-            if x[-1] >= ((self.lbound >> self.bits) << 32) * pmf:
-                x.append(x[-1] >> 32)
-                x[-2] = x[-2] & self.tail_bits
-            x[-1] = ((x[-1] // pmf) << self.bits) + (x[-1] % pmf) + int(self.cdfs[i, s])
-        return x
-
-    def decode(self, x):
-        sequence = np.zeros((self.seq_len,), dtype=np.int64)
-        for i in reversed(range(self.seq_len)):
-            masked_x = x[-1] & self.mask
-            s = np.searchsorted(self.cdfs[i,:-1], masked_x, 'right') - 1
-            sequence[i] = s
-            x[-1] = int(self.pmfs[i,s]) * (x[-1] >> self.bits) + masked_x - int(self.cdfs[i, s])
-            if x[-1] < self.lbound:
-                x[-1] = (x[-1] << 32) | x.pop(-2)
-        sequence = torch.from_numpy(sequence).to(self.device)
-        return x, sequence
 
 def compress(quantbits, nz, bitswap, gpu):
     # model and compression params
@@ -73,9 +18,9 @@ def compress(quantbits, nz, bitswap, gpu):
     zrange = torch.arange(zdim)
     xdim = 32 ** 2 * 1
     xrange = torch.arange(xdim)
-    ansbits = 31 # ANS precision
+    ansbits = NORM_CONST - 1 # ANS precision
     type = torch.float64 # datatype throughout compression
-    device = f"cuda:{gpu}" # gpu
+    device = "cpu" #f"cuda:{gpu}" # gpu
 
     # set up the different channel dimension for different latent depths
     if nz == 8:
@@ -100,8 +45,8 @@ def compress(quantbits, nz, bitswap, gpu):
 
     # compression experiment params
     experiments = 100
-    ndatapoints = 100
-    decompress = False
+    ndatapoints = 10
+    decompress = True
 
     # <=== MODEL ===>
     model = Model(xs = (1, 32, 32), nz=nz, zchannels=1, nprocessing=4, kernel_size=3, resdepth=8, reswidth=reswidth).to(device)
@@ -155,8 +100,8 @@ def compress(quantbits, nz, bitswap, gpu):
         # < ===== COMPRESSION ===>
         # initialize compression
         model.compress()
-        state = list(map(int, np.random.randint(low=1 << 16, high=(1 << 32) - 1, size=10000, dtype=np.uint32))) # fill state list with 'random' bits
-        state[-1] = state[-1] << 32
+        state = list(map(int, np.random.randint(low=1 << 16, high=(1 << NORM_CONST) - 1, size=10000, dtype=np.uint32))) # fill state list with 'random' bits
+        state[-1] = state[-1] << NORM_CONST
         initialstate = state.copy()
         restbits = None
 
@@ -364,6 +309,7 @@ def compress(quantbits, nz, bitswap, gpu):
     np.save(f"plots/mnist{nz}/{'bitswap' if bitswap else 'bbans'}_{quantbits}bits_elbos", elbos)
     np.save(f"plots/mnist{nz}/{'bitswap' if bitswap else 'bbans'}_{quantbits}bits_cmas",cma)
     np.save(f"plots/mnist{nz}/{'bitswap' if bitswap else 'bbans'}_{quantbits}bits_total", total)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

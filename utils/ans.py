@@ -6,6 +6,9 @@ from torchsearchsorted import searchsorted as torch_searchsorted
 # can be installed with sth like: pip install git+https://github.com/aliutkus/torchsearchsorted
 # this method should be available in the next pytorch release
 
+NORM_CONST = 31
+# 31 bc we need to keep in int domain
+
 class ANS:
     """ANS - bitswap implementation"""
     def __init__(self, pmfs: torch.Tensor, bits: int = 31, quantbits: int = 8):
@@ -17,8 +20,8 @@ class ANS:
         self.mask = (1 << bits) - 1
 
         # normalization constants
-        self.lbound = 1 << 32
-        self.tail_bits = (1 << 32) - 1
+        self.lbound = 1 << NORM_CONST
+        self.tail_bits = (1 << NORM_CONST) - 1
 
         self.seq_len, self.support = pmfs.shape
 
@@ -51,9 +54,9 @@ class ANS:
             # print(s, x[-1])
             # print("lbpmf", (((self.lbound >> self.bits) << 32) * pmf))
 
-            if stream[-1] >= ((self.lbound >> self.bits) << 32) * pmf:
+            if stream[-1] >= ((self.lbound >> self.bits) << NORM_CONST) * pmf:
                 # print(True)
-                stream.append(stream[-1] >> 32)
+                stream.append(stream[-1] >> NORM_CONST)
                 stream[-2] = stream[-2] & self.tail_bits
 
             stream[-1] = ((stream[-1] // pmf) << self.bits) + (stream[-1] % pmf) + int(self.cdfs[i, s])
@@ -70,7 +73,7 @@ class ANS:
             sequence[i] = s
             stream[-1] = int(self.pmfs[i, s]) * (stream[-1] >> self.bits) + masked_x - int(self.cdfs[i, s])
             if stream[-1] < self.lbound:
-                stream[-1] = (stream[-1] << 32) | stream.pop(-2)
+                stream[-1] = (stream[-1] << NORM_CONST) | stream.pop(-2)
         sequence = torch.from_numpy(sequence).to(self.device)
         return stream, sequence
 
@@ -94,9 +97,14 @@ class ANS:
 
 class VectorizedANS(ANS):
 
-    def __init__(self, pmfs: torch.Tensor, bits: int = 33, quantbits: int = 8):
-        # bits is 33 to keep state in int64 domain
-        super().__init__(pmfs, bits, quantbits)
+    def __init__(self, pmfs: torch.Tensor, bits: int = 31, quantbits: int = 8):
+        if len(pmfs.shape) == 2:
+            pmfs = pmfs.unsqueeze(0)
+            # pmfs should be of shape b_t_p
+
+
+
+        # super().__init__(pmfs, bits, quantbits)
         self.device = pmfs.device
         self.bits = bits
         self.quantbits = quantbits
@@ -105,10 +113,10 @@ class VectorizedANS(ANS):
         self.mask = (1 << bits) - 1
 
         # normalization constants
-        self.lbound = 1 << 32
-        self.tail_bits = (1 << 32) - 1
+        self.lbound = 1 << NORM_CONST
+        self.tail_bits = (1 << NORM_CONST) - 1
 
-        self.seq_len, self.support = pmfs.shape
+        self.n_seqs, self.seq_len, self.support = pmfs.shape
 
         # compute pmf's and cdf's scaled up by 2**n
         multiplier = (1 << self.bits) - (1 << self.quantbits)
@@ -118,50 +126,58 @@ class VectorizedANS(ANS):
         self.pmfs += torch.ones_like(self.pmfs)
 
         # add remnant to the maximum value of the probabilites
-        self.pmfs[torch.arange(0, self.seq_len), torch.argmax(self.pmfs, dim=1)] += (
-                (1 << self.bits) - self.pmfs.sum(1))
+        for i in range(self.n_seqs):
+            self.pmfs[i, torch.arange(0, self.seq_len), torch.argmax(self.pmfs[i], dim=1)] += (
+                    (1 << self.bits) - self.pmfs[i].sum(1))
 
         # compute cdf's
-        self.cdfs = torch.cumsum(self.pmfs, dim=1)  # compute CDF (scaled up to 2**n)
-        self.cdfs = torch.cat([torch.zeros([self.cdfs.shape[0], 1], dtype=torch.long, device=self.device), self.cdfs],
-                              dim=1)  # pad with 0 at the beginning
+        self.cdfs = torch.cumsum(self.pmfs, dim=2)  # compute CDF (scaled up to 2**n)
+        # print(self.cdfs.shape)
+        self.cdfs = torch.cat([torch.zeros([self.n_seqs, self.cdfs.shape[1], 1], dtype=torch.long, device=self.device), self.cdfs],
+                              dim=2)  # pad with 0 at the beginning
 
-        assert self.cdfs.shape == (self.seq_len, self.support + 1)
-        assert torch.all(self.cdfs[:, -1] == (1 << bits))
+        assert self.pmfs.shape == (self.n_seqs, self.seq_len, self.support)
+        assert self.cdfs.shape == (self.n_seqs, self.seq_len, self.support + 1)
+        assert torch.all(self.cdfs[:, :, -1] == (1 << bits))
+
+        self.pmfs_t_b_p = self.pmfs.transpose(0,1)
+        self.cdfs_t_b_p = self.cdfs.transpose(0,1)
 
     def encode(self, stream: List[int], sequence: torch.Tensor):
         return self.batch_encode([stream], sequence.unsqueeze(0))[0]
 
     def decode(self, stream: List[int]):
-        return self.batch_decode([stream])[0]
+        streams, symbols = self.batch_decode([stream])
+        return streams[0], symbols[0]
 
     def batch_encode(self, streams_b_t: List[List[int]], symbols_b_t: torch.Tensor):
         symbols_t_b = symbols_b_t.t()
         for i, s in enumerate(symbols_t_b):
-            pmf = self.pmfs[i, s]
-
+            pmf = self.pmfs_t_b_p[i, torch.arange(self.n_seqs), s]
+            cdf = self.cdfs_t_b_p[i, torch.arange(self.n_seqs), s]
             old_streams_tops = torch.tensor(
                 [int(s[-1]) for s in streams_b_t],
                 device=self.device,
             )
             # print(s, old_streams_tops, old_streams_tops.type())
 
-            rbound = ((self.lbound >> self.bits) << 32)
+            rbound = ((self.lbound >> self.bits) << NORM_CONST)
             # print(rbound, np.log(rbound) / np.log(2))
-            overflows = old_streams_tops / pmf >= ((self.lbound >> self.bits) << 32)
+            
+            overflows = old_streams_tops / pmf >= ((self.lbound >> self.bits) << NORM_CONST)
 
             # print("ost/pmf", old_streams_tops / pmf)
             # a hack because multiplying right side by pmf causes overflow, in pytorch we can't go higher than int64
 
             # print("lbpmf", (((self.lbound >> self.bits) << 32) * pmf))
             new_streams_tops = torch.ones_like(old_streams_tops) * -1
-            new_streams_tops[overflows] = old_streams_tops[overflows] >> 32
+            new_streams_tops[overflows] = old_streams_tops[overflows] >> NORM_CONST
             old_streams_tops[overflows] = old_streams_tops[overflows] & self.tail_bits
             new_streams_tops[~overflows] = old_streams_tops[~overflows]
 
             # print("nst", new_streams_tops)
             # print("pmf", pmf)
-            # print("nst/pmf", new_streams_tops / pmf)
+            # print("nst/pmf", new_streams_tops / pmf, ((self.lbound >> self.bits) << 34))
             # print("nst_pmf_b", ((new_streams_tops / pmf) << self.bits))
             # print("nst%pmf", ((new_streams_tops % pmf)))
 
@@ -170,7 +186,7 @@ class VectorizedANS(ANS):
                                        (new_streams_tops // pmf) << self.bits
                                ) + (
                                        new_streams_tops % pmf
-                               ) + self.cdfs[i, s]
+                               ) + cdf
 
             # print("nst after", new_streams_tops)
             for (s_b_t, ost, o, n) in zip(streams_b_t, old_streams_tops, overflows, new_streams_tops):
@@ -202,19 +218,23 @@ class VectorizedANS(ANS):
             )
             masked_streams_tops = old_streams_tops & self.mask
 
+            # print(self.cdfs.transpose(0,1)[i][..., :-1].shape)
+            # print(self.cdfs.transpose(0,1)[i][torch.arange(self.n_seqs), :-1].shape)
+            # print( masked_streams_tops.unsqueeze(1).shape)
             symbols = torch_searchsorted(
-                self.cdfs[i, :-1].unsqueeze(0), masked_streams_tops.unsqueeze(0), side='right'
+                self.cdfs_t_b_p[i][torch.arange(self.n_seqs), :-1], masked_streams_tops.unsqueeze(1), side='right'
             ) - 1
 
-            symbols = symbols.reshape(symbols.shape[1])
+            # print(symbols.shape)
+            symbols = symbols.reshape(symbols.shape[0])
             # for seq, s in zip(sequences, symbols):
             #     seq.append(s)
 
-            new_streams_tops = self.pmfs[i, symbols] * (old_streams_tops >> self.bits) + masked_streams_tops - \
-                               self.cdfs[i, symbols]
+            new_streams_tops = self.pmfs_t_b_p[i, torch.arange(self.n_seqs), symbols] * (old_streams_tops >> self.bits) + masked_streams_tops - \
+                               self.cdfs_t_b_p[i, torch.arange(self.n_seqs), symbols]
             underflows = new_streams_tops < self.lbound
 
-            new_streams_tops[underflows] = (new_streams_tops[underflows] << 32) | older_streams_tops[underflows]
+            new_streams_tops[underflows] = (new_streams_tops[underflows] << NORM_CONST) | older_streams_tops[underflows]
 
             for (stream, u, n, seq, s) in zip(streams_b_t, underflows, new_streams_tops, sequences, symbols):
                 stream.pop()
@@ -264,7 +284,11 @@ if __name__ == '__main__':
 
 
     vans = VectorizedANS(
-        pmfs=pmfs,
+        pmfs=torch.tensor([
+            pmfs.numpy()
+            for _ in 
+            range(n_codes)
+        ]),
         bits=33
     )
 
