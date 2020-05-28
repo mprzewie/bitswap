@@ -134,15 +134,9 @@ def compress(quantbits, nz, bitswap, gpu):
         for zi in range(nz):
             z_enc_pmfs = []
             xs = []
-            for xi in range(len(datapoints)):
+            for xi in tqdm(range(len(datapoints))):
                 (x, _) = datapoints[xi]
                 x = x.to(device).view(xdim)
-                
-                with torch.no_grad():
-                    model.compress(False)
-                    logrecon, logdec, logenc, _ = model.loss(x.view((-1,) + model.xs))
-                    elbo = -logrecon + torch.sum(-logdec + logenc)
-                    model.compress(True)
                 
 
                 input = zcentres[zi - 1, zrange, zsyms[xi]] if zi > 0 else xcentres[xrange, x.long()]
@@ -169,7 +163,7 @@ def compress(quantbits, nz, bitswap, gpu):
                 ]),  "too few initial bits" # otherwise initial state consists of too few bits
 
             z_dec_pmfs = []
-            for zsymtop in zsymtops:
+            for zsymtop in tqdm(zsymtops):
                 z = zcentres[zi, zrange, zsymtop]
                 mu, scale = model.generate(zi)(given=z)
                 cdfs = logistic_cdf((zendpoints[zi - 1] if zi > 0 else xendpoints).t(), mu, scale).t() # most expensive calculation?
@@ -215,6 +209,14 @@ def compress(quantbits, nz, bitswap, gpu):
             zip(totaladdedbits_for_xs, totalbits_for_xs)
         ))
         for xi, (totaladdedbits, totalbits) in iterator:
+            (x, _) = datapoints[xi]
+            x = x.to(device).view(xdim)
+            with torch.no_grad():
+                model.compress(False)
+                logrecon, logdec, logenc, _ = model.loss(x.view((-1,) + model.xs))
+                elbo = -logrecon + torch.sum(-logdec + logenc)
+                model.compress(True)
+
             nets[ei, xi] = (totaladdedbits / xdim) - nets[ei, :xi].sum()
             elbos[ei, xi] = elbo.item() / xdim
             cma[ei, xi] = totalbits / (xdim * (xi + 1))
@@ -246,7 +248,7 @@ def compress(quantbits, nz, bitswap, gpu):
             zs = z = zcentres[zi, zrange, zsymtops]
 
             z_dec_pmfs = []
-            for xi in range(len(datapoints)):
+            for xi in tqdm(range(len(datapoints))):
 
                 z = zs[xi]
                 mu, scale = model.generate(zi)(given=z)
@@ -265,7 +267,7 @@ def compress(quantbits, nz, bitswap, gpu):
             inputs = zcentres[zi - 1, zrange, symbols] if zi > 0 else xcentres[xrange, symbols]
 
             z_enc_pmfs = []
-            for input in inputs:
+            for input in tqdm(inputs):
                 mu, scale = model.infer(zi)(given=input)
                 cdfs = logistic_cdf(zendpoints[zi].t(), mu, scale).t() # most expensive calculation?
                 pmfs = cdfs[:, 1:] - cdfs[:, :-1]
