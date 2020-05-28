@@ -9,7 +9,7 @@ import time
 import argparse
 from tqdm import tqdm
 import pickle
-from utils.ans import NORM_CONST, ANS, VectorizedANS as ANS
+from utils.ans import NORM_CONST, ANS#, VectorizedANS as ANS
 
 
 def compress(quantbits, nz, bitswap, gpu):
@@ -44,8 +44,8 @@ def compress(quantbits, nz, bitswap, gpu):
     torch.backends.cudnn.benchmark = True
 
     # compression experiment params
-    experiments = 100
-    ndatapoints = 10
+    experiments = 10
+    ndatapoints = 100
     decompress = True
 
     # <=== MODEL ===>
@@ -91,6 +91,8 @@ def compress(quantbits, nz, bitswap, gpu):
     print("Compression..")
     for ei in range(experiments):
         print(f"Experiment {ei + 1}")
+        experiment_start_time = time.time()
+
         subset = Subset(test_set, randindices[ei])
         test_loader = DataLoader(
             dataset=subset,
@@ -101,7 +103,7 @@ def compress(quantbits, nz, bitswap, gpu):
         # initialize compression
         model.compress()
         state = list(map(int, np.random.randint(low=1 << 16, high=(1 << NORM_CONST) - 1, size=10000, dtype=np.uint32))) # fill state list with 'random' bits
-        state[-1] = state[-1] << NORM_CONST
+        state[-1] = state[-1] << 16 #NORM_CONST
         initialstate = state.copy()
         restbits = None
 
@@ -301,6 +303,8 @@ def compress(quantbits, nz, bitswap, gpu):
 
         # check if the initial state matches the output state
         assert initialstate == state
+        experiment_end_time = time.time()
+        print("Experiment time", experiment_end_time - experiment_start_time)
 
     print(f"N:{nets.mean():.4f}±{nets.std():.2f}, E:{elbos.mean():.4f}±{elbos.std():.2f}, D:{nets.mean() - elbos.mean():.6f}")
 
