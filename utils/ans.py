@@ -237,7 +237,7 @@ class VectorizedANS(ANS):
             symbols = torch.searchsorted(
                 self.cdfs_t_b_p[i][v_pointers, :-1], 
                 masked_streams_tops.unsqueeze(1), 
-                right=True,#side='right'
+                right=True,'
             ) - 1
 
             symbols = symbols.reshape(symbols.shape[0])
