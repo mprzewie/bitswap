@@ -20,7 +20,7 @@ def compress(quantbits, nz, bitswap, gpu):
     xrange = torch.arange(xdim)
     ansbits = NORM_CONST - 1 # ANS precision
     type = torch.float64 # datatype throughout compression
-    device = "cpu" #f"cuda:{gpu}" # gpu
+    device = "cuda:0" #f"cuda:{gpu}" # gpu
 
     # set up the different channel dimension for different latent depths
     if nz == 8:
@@ -124,36 +124,64 @@ def compress(quantbits, nz, bitswap, gpu):
         initialstates = deepcopy(states)
         reststates = None
 
+        state_init = time.time()
+
         
         iterator = tqdm(range(len(datapoints)), desc="Sender")
 
         # <===== SENDER =====>
 
-        pmfs_cache = dict()
         ####
+        xs = []
+        for xi in range(len(datapoints)):
+            (x, _) = datapoints[xi]
+            x = x.to(device).view(xdim)
+            xs.append(x)
+
         for zi in range(nz):
             z_enc_pmfs = []
-            xs = []
+            mus = []
+            scales = []
             for xi in tqdm(range(len(datapoints))):
-                (x, _) = datapoints[xi]
-                x = x.to(device).view(xdim)
-                
+                x = xs[xi]
+                # s = time.time()
 
                 input = zcentres[zi - 1, zrange, zsyms[xi]] if zi > 0 else xcentres[xrange, x.long()]
                 mu, scale = model.infer(zi)(given=input)
-                cdfs = logistic_cdf(zendpoints[zi].t(), mu, scale).t() # most expensive calculation?
+                mus.append(mu)
+                scales.append(scale)
+
+
+            s = time.time()
+            cdfs_b = logistic_cdf(
+                torch.stack(
+                    [zendpoints[zi]]*len(datapoints)
+                    ).permute(2, 0, 1), 
+                torch.stack(mus), 
+                torch.stack(scales)
+            ).permute(1, 2, 0)
+
+            t = time.time()
+            print("log cdf", t - s)
+
+            for cdfs in cdfs_b:
+                
                 pmfs = cdfs[:, 1:] - cdfs[:, :-1]
                 pmfs = torch.cat((cdfs[:, 0].unsqueeze(1), pmfs, 1. - cdfs[:, -1].unsqueeze(1)), dim=1)
+                t = time.time()
 
                 z_enc_pmfs.append(pmfs)
-                xs.append(x)
             
+            s = time.time()
             ans = ANS(
                 torch.stack(z_enc_pmfs),
                 bits=ansbits, quantbits=quantbits
             )
-
+            t1 = time.time()
             states, zsymtops = ans.batch_decode(states)
+            t2 = time.time()
+            print("sender decode", t1 - s, t2 - t1)
+
 
             if zi == 0:
                 reststates = states.copy()
@@ -163,10 +191,26 @@ def compress(quantbits, nz, bitswap, gpu):
                 ]),  "too few initial bits" # otherwise initial state consists of too few bits
 
             z_dec_pmfs = []
+            mus = []
+            scales = []
             for zsymtop in tqdm(zsymtops):
                 z = zcentres[zi, zrange, zsymtop]
                 mu, scale = model.generate(zi)(given=z)
-                cdfs = logistic_cdf((zendpoints[zi - 1] if zi > 0 else xendpoints).t(), mu, scale).t() # most expensive calculation?
+                mus.append(mu)
+                scales.append(scale)
+            
+            cdfs_b = logistic_cdf(
+                torch.stack(
+                    [
+                        (zendpoints[zi - 1] if zi > 0 else xendpoints)
+                    ]*len(datapoints)
+                ).permute(2, 0, 1), 
+                torch.stack(mus), 
+                torch.stack(scales)
+            ).permute(1, 2, 0)
+
+            for cdfs in cdfs_b:
+                # cdfs = logistic_cdf((zendpoints[zi - 1] if zi > 0 else xendpoints).t(), mu, scale).t() # most expensive calculation?
                 pmfs = cdfs[:, 1:] - cdfs[:, :-1]
                 pmfs = torch.cat((cdfs[:, 0].unsqueeze(1), pmfs, 1. - cdfs[:, -1].unsqueeze(1)), dim=1)
 
@@ -185,12 +229,14 @@ def compress(quantbits, nz, bitswap, gpu):
 
             zsyms = zsymtops
 
-
-        ###
-
         states = ANS(
-            prior_pmfs, bits=ansbits, quantbits=quantbits
+            torch.stack([
+                prior_pmfs
+                for _ in range(len(datapoints))
+            ]), 
+            bits=ansbits, quantbits=quantbits
         ).batch_encode(states, zsymtops)
+        
 
         totaladdedbits_for_xs = [
             (len(state) - len(initialstate)) * 32
@@ -209,8 +255,7 @@ def compress(quantbits, nz, bitswap, gpu):
             zip(totaladdedbits_for_xs, totalbits_for_xs)
         ))
         for xi, (totaladdedbits, totalbits) in iterator:
-            (x, _) = datapoints[xi]
-            x = x.to(device).view(xdim)
+            x = xs[xi]
             with torch.no_grad():
                 model.compress(False)
                 logrecon, logdec, logenc, _ = model.loss(x.view((-1,) + model.xs))
@@ -241,18 +286,35 @@ def compress(quantbits, nz, bitswap, gpu):
 
         # priors
         states, zsymtops = ANS(
-            prior_pmfs, bits=ansbits, quantbits=quantbits
+            torch.stack([
+                prior_pmfs
+                for _ in range(len(datapoints))
+            ]), 
+            bits=ansbits, quantbits=quantbits
         ).batch_decode(states)
 
         for zi in reversed(range(nz)):
             zs = z = zcentres[zi, zrange, zsymtops]
 
             z_dec_pmfs = []
+            mus = []
+            scales = []
             for xi in tqdm(range(len(datapoints))):
 
                 z = zs[xi]
                 mu, scale = model.generate(zi)(given=z)
-                cdfs = logistic_cdf((zendpoints[zi - 1] if zi > 0 else xendpoints).t(), mu, scale).t()  # most expensive calculation?
+                mus.append(mu)
+                scales.append(scale)
+            
+            cdfs_b = logistic_cdf(
+                torch.stack(
+                    [(zendpoints[zi - 1] if zi > 0 else xendpoints)]*len(datapoints)
+                    ).permute(2, 0, 1), 
+                torch.stack(mus), 
+                torch.stack(scales)
+            ).permute(1, 2, 0)
+
+            for cdfs in cdfs_b:
                 pmfs = cdfs[:, 1:] - cdfs[:, :-1]
                 pmfs = torch.cat((cdfs[:, 0].unsqueeze(1), pmfs, 1. - cdfs[:, -1].unsqueeze(1)), dim=1)
                 z_dec_pmfs.append(pmfs)
@@ -267,12 +329,30 @@ def compress(quantbits, nz, bitswap, gpu):
             inputs = zcentres[zi - 1, zrange, symbols] if zi > 0 else xcentres[xrange, symbols]
 
             z_enc_pmfs = []
+
+            mus = []
+            scales = []
+
+
             for input in tqdm(inputs):
                 mu, scale = model.infer(zi)(given=input)
-                cdfs = logistic_cdf(zendpoints[zi].t(), mu, scale).t() # most expensive calculation?
+                mus.append(mu)
+                scales.append(scale)
+
+            cdfs_b = logistic_cdf(
+                torch.stack(
+                    [zendpoints[zi]]*len(datapoints)
+                    ).permute(2, 0, 1), 
+                torch.stack(mus), 
+                torch.stack(scales)
+            ).permute(1, 2, 0)
+
+            for cdfs in cdfs_b:
                 pmfs = cdfs[:, 1:] - cdfs[:, :-1]
                 pmfs = torch.cat((cdfs[:, 0].unsqueeze(1), pmfs, 1. - cdfs[:, -1].unsqueeze(1)), dim=1)
                 z_enc_pmfs.append(pmfs)
+
+            
 
             ans = ANS(
                 torch.stack(z_enc_pmfs),

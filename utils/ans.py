@@ -1,10 +1,13 @@
 from typing import List, Tuple
-
+from tqdm import tqdm
 import numpy as np
 import torch
-from torchsearchsorted import searchsorted as torch_searchsorted
-# can be installed with sth like: pip install git+https://github.com/aliutkus/torchsearchsorted
-# this method should be available in the next pytorch release
+# we need torch >= 1.6 in order to use searchsorted method. 
+# It's not yet officially released, but it can be installed from
+# https://download.pytorch.org/whl/nightly/cu102/torch_nightly.html
+
+from time import time
+
 
 NORM_CONST = 31
 # 31 bc we need to keep in int domain
@@ -12,6 +15,7 @@ NORM_CONST = 31
 class ANS:
     """ANS - bitswap implementation"""
     def __init__(self, pmfs: torch.Tensor, bits: int = 31, quantbits: int = 8):
+        init_s = time()
         self.device = pmfs.device
         self.bits = bits
         self.quantbits = quantbits
@@ -26,11 +30,17 @@ class ANS:
         self.seq_len, self.support = pmfs.shape
 
         # compute pmf's and cdf's scaled up by 2**n
+        t1 = time()
+
         multiplier = (1 << self.bits) - (1 << self.quantbits)
         self.pmfs = (pmfs * multiplier).long()
+        t11 = time()
 
         # add ones to counter zero probabilities
         self.pmfs += torch.ones_like(self.pmfs)
+
+        t2 = time()
+        # print("mult", (t11 - t1), "add", (t2 - t11))
 
         # add remnant to the maximum value of the probabilites
         self.pmfs[torch.arange(0, self.seq_len), torch.argmax(self.pmfs, dim=1)] += (
@@ -47,6 +57,8 @@ class ANS:
 
         assert self.cdfs.shape == (self.seq_len, self.support + 1)
         assert np.all(self.cdfs[:, -1] == (1 << bits))
+        init_e = time()
+        # print("ans init", init_e - init_s)
 
     def encode(self, stream: List[int], sequence: torch.Tensor) -> List[int]:
         for i, s in enumerate(sequence):
@@ -61,8 +73,6 @@ class ANS:
 
             stream[-1] = ((stream[-1] // pmf) << self.bits) + (stream[-1] % pmf) + int(self.cdfs[i, s])
 
-            # print("nst after", x[-1])
-            # print("----")
         return stream
 
     def decode(self, stream: List[int]) -> Tuple[List[int], torch.Tensor]:
@@ -98,10 +108,10 @@ class ANS:
 class VectorizedANS(ANS):
 
     def __init__(self, pmfs: torch.Tensor, bits: int = 31, quantbits: int = 8):
+        init_s = time()
         if len(pmfs.shape) == 2:
             pmfs = pmfs.unsqueeze(0)
             # pmfs should be of shape b_t_p
-
 
 
         # super().__init__(pmfs, bits, quantbits)
@@ -112,6 +122,7 @@ class VectorizedANS(ANS):
         # mask of 2**bits - 1 bits
         self.mask = (1 << bits) - 1
 
+
         # normalization constants
         self.lbound = 1 << NORM_CONST
         self.tail_bits = (1 << NORM_CONST) - 1
@@ -120,21 +131,32 @@ class VectorizedANS(ANS):
 
         # compute pmf's and cdf's scaled up by 2**n
         multiplier = (1 << self.bits) - (1 << self.quantbits)
-        self.pmfs = (pmfs * multiplier).long()
 
-        # add ones to counter zero probabilities
-        self.pmfs += torch.ones_like(self.pmfs)
+        if self.device == torch.device("cpu"):
+            self.pmfs = torch.stack([
+                (pmf * multiplier) + torch.ones_like(pmf)
+                for pmf in pmfs
+            ]).long()
+        else:
+            self.pmfs = ((pmfs * multiplier) + torch.ones_like(pmfs)).long()
 
-        # add remnant to the maximum value of the probabilites
+        # print("mult", (t11 - t1), "add", (t2 - t11))
+
+
         for i in range(self.n_seqs):
-            self.pmfs[i, torch.arange(0, self.seq_len), torch.argmax(self.pmfs[i], dim=1)] += (
-                    (1 << self.bits) - self.pmfs[i].sum(1))
-
+            self.pmfs[
+                i, torch.arange(0, self.seq_len), torch.argmax(self.pmfs[i], dim=1)
+            ] += ((1 << self.bits) - self.pmfs[i].sum(1))
+        t3 = time()
         # compute cdf's
         self.cdfs = torch.cumsum(self.pmfs, dim=2)  # compute CDF (scaled up to 2**n)
         # print(self.cdfs.shape)
-        self.cdfs = torch.cat([torch.zeros([self.n_seqs, self.cdfs.shape[1], 1], dtype=torch.long, device=self.device), self.cdfs],
-                              dim=2)  # pad with 0 at the beginning
+        self.cdfs = torch.cat(
+            [
+                torch.zeros([self.n_seqs, self.cdfs.shape[1], 1], dtype=torch.long, device=self.device), 
+                self.cdfs
+            ],
+        dim=2)  # pad with 0 at the beginning
 
         assert self.pmfs.shape == (self.n_seqs, self.seq_len, self.support)
         assert self.cdfs.shape == (self.n_seqs, self.seq_len, self.support + 1)
@@ -142,6 +164,8 @@ class VectorizedANS(ANS):
 
         self.pmfs_t_b_p = self.pmfs.transpose(0,1)
         self.cdfs_t_b_p = self.cdfs.transpose(0,1)
+
+
 
     def encode(self, stream: List[int], sequence: torch.Tensor):
         return self.batch_encode([stream], sequence.unsqueeze(0))[0]
@@ -152,102 +176,89 @@ class VectorizedANS(ANS):
 
     def batch_encode(self, streams_b_t: List[List[int]], symbols_b_t: torch.Tensor):
         symbols_t_b = symbols_b_t.t()
-        for i, s in enumerate(symbols_t_b):
-            pmf = self.pmfs_t_b_p[i, torch.arange(self.n_seqs), s]
-            cdf = self.cdfs_t_b_p[i, torch.arange(self.n_seqs), s]
-            old_streams_tops = torch.tensor(
-                [int(s[-1]) for s in streams_b_t],
-                device=self.device,
-            )
-            # print(s, old_streams_tops, old_streams_tops.type())
+        old_streams_tops = torch.tensor(
+            [int(s[-1]) for s in streams_b_t],
+            device=self.device,
+        )
+        b, t = symbols_b_t.shape
 
-            rbound = ((self.lbound >> self.bits) << NORM_CONST)
-            # print(rbound, np.log(rbound) / np.log(2))
-            
+        streams_tensor = torch.ones((b, t+1)).long().to(self.device) * -1
+        h_pointers = torch.zeros(b).long() # point at tops of the streams
+        v_pointers = torch.arange(b).long() 
+        streams_tensor[v_pointers, h_pointers] = old_streams_tops
+
+        for i, s in tqdm(enumerate(symbols_t_b), desc="batch encode"):
+            pmf = self.pmfs_t_b_p[i, torch.arange(self.n_seqs), s]
+            cdf = self.cdfs_t_b_p[i, torch.arange(self.n_seqs), s]            
             overflows = old_streams_tops / pmf >= ((self.lbound >> self.bits) << NORM_CONST)
 
-            # print("ost/pmf", old_streams_tops / pmf)
-            # a hack because multiplying right side by pmf causes overflow, in pytorch we can't go higher than int64
-
-            # print("lbpmf", (((self.lbound >> self.bits) << 32) * pmf))
             new_streams_tops = torch.ones_like(old_streams_tops) * -1
             new_streams_tops[overflows] = old_streams_tops[overflows] >> NORM_CONST
             old_streams_tops[overflows] = old_streams_tops[overflows] & self.tail_bits
             new_streams_tops[~overflows] = old_streams_tops[~overflows]
-
-            # print("nst", new_streams_tops)
-            # print("pmf", pmf)
-            # print("nst/pmf", new_streams_tops / pmf, ((self.lbound >> self.bits) << 34))
-            # print("nst_pmf_b", ((new_streams_tops / pmf) << self.bits))
-            # print("nst%pmf", ((new_streams_tops % pmf)))
-
-            # print("cdf", self.cdfs[i,s])
             new_streams_tops = (
                                        (new_streams_tops // pmf) << self.bits
                                ) + (
                                        new_streams_tops % pmf
                                ) + cdf
 
-            # print("nst after", new_streams_tops)
-            for (s_b_t, ost, o, n) in zip(streams_b_t, old_streams_tops, overflows, new_streams_tops):
-                # print(o.item())
-                s_b_t.pop()
-                if o.item():
-                    # print(ost.item())
-                    s_b_t.append(ost.item())
-
-                # print("n", n)
-                s_b_t.append(n.item())
-                # print("sbt_a", s_b_t[-1])
-            #
-            # print("sbt", streams_b_t[0][-1])
-            # print("---")
-        return streams_b_t
+            streams_tensor[overflows, h_pointers[overflows]] = old_streams_tops[overflows]
+            h_pointers[overflows] += 1
+            streams_tensor[v_pointers, h_pointers] = new_streams_tops
+            old_streams_tops = new_streams_tops
+        new_streams_b_t = streams_tensor.cpu().tolist()
+        h_pointers = h_pointers.cpu().tolist()
+        return [
+            stream[:-1] + new_stream[:h+1]
+            for stream, new_stream, h in zip(streams_b_t, new_streams_b_t, h_pointers)
+        ]
 
     def batch_decode(self, streams_b_t: List[List[int]]) -> Tuple[List[List[int]], torch.Tensor]:
         sequences = [[] for _ in streams_b_t]
+        b = len(streams_b_t)
+        v_pointers = torch.arange(b).long() 
+        h_pointers = torch.tensor(
+            [len(s) for s in streams_b_t]
+        ).long() - 1 # point at tops of the streams
 
-        for i in reversed(range(self.seq_len)):
-            old_streams_tops = torch.tensor(
-                [int(s[-1]) for s in streams_b_t],
-                device=self.device,
-            )
-            older_streams_tops = torch.tensor(
-                [int(s[-2]) for s in streams_b_t],
-                device=self.device,
-            )
+        max_str_len = h_pointers.max() + 1
+        stream_tensor = torch.ones((b, max_str_len)).long() * -1
+        for i, stream in enumerate(streams_b_t):
+            stream_tensor[i, :len(stream)] = torch.tensor(stream).long()
+        
+        stream_tensor = stream_tensor.to(self.device)
+        seq_tensor = torch.zeros((self.n_seqs, self.seq_len)).long().to(self.device)
+
+
+        for i in tqdm(reversed(range(self.seq_len)), desc="batch decode"):
+            old_streams_tops = stream_tensor[v_pointers, h_pointers]
+            older_streams_tops = stream_tensor[v_pointers, h_pointers - 1]
             masked_streams_tops = old_streams_tops & self.mask
-
-            # print(self.cdfs.transpose(0,1)[i][..., :-1].shape)
-            # print(self.cdfs.transpose(0,1)[i][torch.arange(self.n_seqs), :-1].shape)
-            # print( masked_streams_tops.unsqueeze(1).shape)
-            symbols = torch_searchsorted(
-                self.cdfs_t_b_p[i][torch.arange(self.n_seqs), :-1], masked_streams_tops.unsqueeze(1), side='right'
+            symbols = torch.searchsorted(
+                self.cdfs_t_b_p[i][v_pointers, :-1], 
+                masked_streams_tops.unsqueeze(1), 
+                right=True,#side='right'
             ) - 1
 
-            # print(symbols.shape)
             symbols = symbols.reshape(symbols.shape[0])
-            # for seq, s in zip(sequences, symbols):
-            #     seq.append(s)
 
-            new_streams_tops = self.pmfs_t_b_p[i, torch.arange(self.n_seqs), symbols] * (old_streams_tops >> self.bits) + masked_streams_tops - \
-                               self.cdfs_t_b_p[i, torch.arange(self.n_seqs), symbols]
+            new_streams_tops = self.pmfs_t_b_p[i, v_pointers, symbols] * (old_streams_tops >> self.bits) + masked_streams_tops - self.cdfs_t_b_p[i, v_pointers, symbols]
             underflows = new_streams_tops < self.lbound
 
             new_streams_tops[underflows] = (new_streams_tops[underflows] << NORM_CONST) | older_streams_tops[underflows]
+            
+            stream_tensor[v_pointers, h_pointers] = -1
+            h_pointers[underflows] -= 1
+            stream_tensor[underflows, h_pointers[underflows]] = -1
+            stream_tensor[v_pointers, h_pointers] = new_streams_tops
+            seq_tensor[v_pointers, i] = symbols
 
-            for (stream, u, n, seq, s) in zip(streams_b_t, underflows, new_streams_tops, sequences, symbols):
-                stream.pop()
-                if u.item():
-                    stream.pop()
-                stream.append(n)
-                seq.append(s.item())
-
-            # if streams_b_t[-1] < self.lbound:
-            #     streams_b_t[-1] = (streams_b_t[-1] << 32) | streams_b_t.pop(-2)
-        # sequences = torch.from_numpy(sequences).to(self.device)
-        sequences = torch.tensor([list(reversed(seq)) for seq in sequences]).long().to(self.device)
-        return streams_b_t, sequences
+        stream_tensor = stream_tensor.cpu().tolist()
+        h_pointers = h_pointers.cpu().tolist()
+        return [
+            stream[:h+1]
+            for (stream, h) in zip(stream_tensor, h_pointers)
+        ], seq_tensor
 
 if __name__ == '__main__':
 

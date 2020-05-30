@@ -11,7 +11,6 @@ from tqdm import tqdm
 import pickle
 from utils.ans import NORM_CONST, ANS#, VectorizedANS as ANS
 
-
 def compress(quantbits, nz, bitswap, gpu):
     # model and compression params
     zdim = 1 * 16 * 16
@@ -20,7 +19,7 @@ def compress(quantbits, nz, bitswap, gpu):
     xrange = torch.arange(xdim)
     ansbits = NORM_CONST - 1 # ANS precision
     type = torch.float64 # datatype throughout compression
-    device = "cpu" #f"cuda:{gpu}" # gpu
+    device = "cuda:0" #f"cuda:{gpu}" # gpu
 
     # set up the different channel dimension for different latent depths
     if nz == 8:
@@ -125,14 +124,26 @@ def compress(quantbits, nz, bitswap, gpu):
                 # inference and generative model
                 for zi in range(nz):
                     # inference model
+
                     input = zcentres[zi - 1, zrange, zsym] if zi > 0 else xcentres[xrange, x.long()]
                     mu, scale = model.infer(zi)(given=input)
+                    s = time.time()
+
                     cdfs = logistic_cdf(zendpoints[zi].t(), mu, scale).t() # most expensive calculation?
+                    t = time.time()
+                    # print("log cdf", t - s)
+
                     pmfs = cdfs[:, 1:] - cdfs[:, :-1]
                     pmfs = torch.cat((cdfs[:, 0].unsqueeze(1), pmfs, 1. - cdfs[:, -1].unsqueeze(1)), dim=1)
 
+
                     # decode z
-                    state, zsymtop = ANS(pmfs, bits=ansbits, quantbits=quantbits).decode(state)
+                    s = time.time()
+                    ans = ANS(pmfs, bits=ansbits, quantbits=quantbits)
+                    t1 = time.time()
+                    state, zsymtop = ans.decode(state)
+                    t2 = time.time()
+                    # print("sender decode", t1 - s, t2 - t1)
 
                     # save excess bits for calculations
                     if xi == zi == 0:
@@ -164,6 +175,7 @@ def compress(quantbits, nz, bitswap, gpu):
 
                     # decode z
                     state, zsymtop = ANS(pmfs, bits=ansbits, quantbits=quantbits).decode(state)
+
                     zs.append(zsymtop)
 
                     zsym = zsymtop
