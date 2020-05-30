@@ -139,14 +139,10 @@ def compress(quantbits, nz, bitswap, gpu):
             xs.append(x)
 
         for zi in range(nz):
-            z_enc_pmfs = []
             mus = []
             scales = []
             for xi in tqdm(range(len(datapoints))):
-                x = xs[xi]
-                # s = time.time()
-
-                input = zcentres[zi - 1, zrange, zsyms[xi]] if zi > 0 else xcentres[xrange, x.long()]
+                input = zcentres[zi - 1, zrange, zsyms[xi]] if zi > 0 else xcentres[xrange, xs[xi].long()]
                 mu, scale = model.infer(zi)(given=input)
                 mus.append(mu)
                 scales.append(scale)
@@ -161,26 +157,19 @@ def compress(quantbits, nz, bitswap, gpu):
                 torch.stack(scales)
             ).permute(1, 2, 0)
 
-            t = time.time()
-            print("log cdf", t - s)
-
-            for cdfs in cdfs_b:
+            pmfs_b = torch.cat((
+                cdfs_b[:, :, 0].unsqueeze(2), 
+                cdfs_b[:, :, 1:] - cdfs_b[:, :, :-1], 
+                1. - cdfs_b[:, :, -1].unsqueeze(2)
+            ), dim=2)
                 
-                pmfs = cdfs[:, 1:] - cdfs[:, :-1]
-                pmfs = torch.cat((cdfs[:, 0].unsqueeze(1), pmfs, 1. - cdfs[:, -1].unsqueeze(1)), dim=1)
-                t = time.time()
-
-                z_enc_pmfs.append(pmfs)
-            
-            s = time.time()
             ans = ANS(
-                torch.stack(z_enc_pmfs),
+                pmfs_b,
                 bits=ansbits, quantbits=quantbits
             )
             t1 = time.time()
             states, zsymtops = ans.batch_decode(states)
             t2 = time.time()
-            print("sender decode", t1 - s, t2 - t1)
 
 
             if zi == 0:
@@ -209,15 +198,14 @@ def compress(quantbits, nz, bitswap, gpu):
                 torch.stack(scales)
             ).permute(1, 2, 0)
 
-            for cdfs in cdfs_b:
-                # cdfs = logistic_cdf((zendpoints[zi - 1] if zi > 0 else xendpoints).t(), mu, scale).t() # most expensive calculation?
-                pmfs = cdfs[:, 1:] - cdfs[:, :-1]
-                pmfs = torch.cat((cdfs[:, 0].unsqueeze(1), pmfs, 1. - cdfs[:, -1].unsqueeze(1)), dim=1)
-
-                z_dec_pmfs.append(pmfs)
+            pmfs_b = torch.cat((
+                cdfs_b[:, :, 0].unsqueeze(2), 
+                cdfs_b[:, :, 1:] - cdfs_b[:, :, :-1], 
+                1. - cdfs_b[:, :, -1].unsqueeze(2)
+            ), dim=2)
             
             ans = ANS(
-                torch.stack(z_dec_pmfs),
+                pmfs_b,
                 bits=ansbits, quantbits=quantbits
             )
 
@@ -254,20 +242,20 @@ def compress(quantbits, nz, bitswap, gpu):
             enumerate(
             zip(totaladdedbits_for_xs, totalbits_for_xs)
         ))
-        for xi, (totaladdedbits, totalbits) in iterator:
-            x = xs[xi]
-            with torch.no_grad():
+        with torch.no_grad():
+            for xi, (totaladdedbits, totalbits) in iterator:
+                x = xs[xi]
                 model.compress(False)
                 logrecon, logdec, logenc, _ = model.loss(x.view((-1,) + model.xs))
                 elbo = -logrecon + torch.sum(-logdec + logenc)
                 model.compress(True)
 
-            nets[ei, xi] = (totaladdedbits / xdim) - nets[ei, :xi].sum()
-            elbos[ei, xi] = elbo.item() / xdim
-            cma[ei, xi] = totalbits / (xdim * (xi + 1))
-            total[ei, xi] = totalbits
+                nets[ei, xi] = (totaladdedbits / xdim) - nets[ei, :xi].sum()
+                elbos[ei, xi] = elbo.item() / xdim
+                cma[ei, xi] = totalbits / (xdim * (xi + 1))
+                total[ei, xi] = totalbits
 
-            iterator.set_postfix_str(s=f"N:{nets[ei,:xi+1].mean():.2f}±{nets[ei,:xi+1].std():.2f}, D:{nets[ei,:xi+1].mean()-elbos[ei,:xi+1].mean():.4f}, C: {cma[ei,:xi+1].mean():.2f}, T: {totalbits:.0f}", refresh=False)
+                iterator.set_postfix_str(s=f"N:{nets[ei,:xi+1].mean():.2f}±{nets[ei,:xi+1].std():.2f}, D:{nets[ei,:xi+1].mean()-elbos[ei,:xi+1].mean():.4f}, C: {cma[ei,:xi+1].mean():.2f}, T: {totalbits:.0f}", refresh=False)
 
 
         state_file = f"bitstreams/mnist/nz{nz}/{'Bit-Swap' if bitswap else 'BB-ANS'}/{'Bit-Swap' if bitswap else 'BB-ANS'}_{quantbits}bits_nz{nz}_experiment{ei + 1}_batch"
@@ -282,7 +270,6 @@ def compress(quantbits, nz, bitswap, gpu):
             states = pickle.load(fp)
 
         # <===== RECEIVER =====>
-
 
         # priors
         states, zsymtops = ANS(
@@ -314,13 +301,14 @@ def compress(quantbits, nz, bitswap, gpu):
                 torch.stack(scales)
             ).permute(1, 2, 0)
 
-            for cdfs in cdfs_b:
-                pmfs = cdfs[:, 1:] - cdfs[:, :-1]
-                pmfs = torch.cat((cdfs[:, 0].unsqueeze(1), pmfs, 1. - cdfs[:, -1].unsqueeze(1)), dim=1)
-                z_dec_pmfs.append(pmfs)
+            pmfs_b = torch.cat((
+                cdfs_b[:, :, 0].unsqueeze(2), 
+                cdfs_b[:, :, 1:] - cdfs_b[:, :, :-1], 
+                1. - cdfs_b[:, :, -1].unsqueeze(2)
+            ), dim=2)
             
             ans = ANS(
-                torch.stack(z_dec_pmfs),
+                pmfs_b,
                 bits=ansbits, quantbits=quantbits
             )
             
@@ -328,11 +316,8 @@ def compress(quantbits, nz, bitswap, gpu):
 
             inputs = zcentres[zi - 1, zrange, symbols] if zi > 0 else xcentres[xrange, symbols]
 
-            z_enc_pmfs = []
-
             mus = []
             scales = []
-
 
             for input in tqdm(inputs):
                 mu, scale = model.infer(zi)(given=input)
@@ -347,20 +332,18 @@ def compress(quantbits, nz, bitswap, gpu):
                 torch.stack(scales)
             ).permute(1, 2, 0)
 
-            for cdfs in cdfs_b:
-                pmfs = cdfs[:, 1:] - cdfs[:, :-1]
-                pmfs = torch.cat((cdfs[:, 0].unsqueeze(1), pmfs, 1. - cdfs[:, -1].unsqueeze(1)), dim=1)
-                z_enc_pmfs.append(pmfs)
-
-            
+            pmfs_b = torch.cat((
+                cdfs_b[:, :, 0].unsqueeze(2), 
+                cdfs_b[:, :, 1:] - cdfs_b[:, :, :-1], 
+                1. - cdfs_b[:, :, -1].unsqueeze(2)
+            ), dim=2)
 
             ans = ANS(
-                torch.stack(z_enc_pmfs),
+                pmfs_b,
                 bits=ansbits, quantbits=quantbits
             )
 
             states = ans.batch_encode(states, zsymtops)
-
             zsymtops = symbols
 
         assert all([
