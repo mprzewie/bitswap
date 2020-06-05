@@ -2,6 +2,7 @@ from typing import List, Tuple
 from tqdm import tqdm
 import numpy as np
 import torch
+import pandas as pd
 # we need torch >= 1.6 in order to use searchsorted method. 
 # It's not yet officially released, but it can be installed from
 # https://download.pytorch.org/whl/nightly/cu102/torch_nightly.html
@@ -129,11 +130,6 @@ class VectorizedANS(ANS):
         init_s = time()
         if len(pmfs.shape) == 2:
             pmfs = pmfs.unsqueeze(0)
-            # pmfs should be of shape b_t_p powinien być trój wymiarowy
-            # p - prawdopodobieństwa dla elementów
-            # t - każdy kolejnyu element w sekwencji może mieć  (wektro prawdopodobieństw może być powtóżony wiele razy
-            # b - wielkość batach  dla uproszczenia możemy uznać ze ma takie samo prawdopodobieństwo
-            # ans
 
         # super().__init__(pmfs, bits, quantbits)
         self.device = pmfs.device
@@ -297,69 +293,74 @@ if __name__ == '__main__':
     # code_letters_1 = "BABCCCBABCCCAA"#np.random.choice(letters, 4, p=probabilities)
     n_letters = 1000
     n_codes = 100
+    vec_time_array = []
+    loop_time_array = []
 
-    codes_letters = []
-    codes = []
-    states = []
-
-    # for i in range(n_codes):
-    #     code_letters = np.random.choice(letters, n_letters, p=probabilities).tolist()
-    #     code = [letters.index(l) for l in code_letters]
-    #     state = list(map(int, np.random.randint(low=1 << 8, high=(1 << 16) - 1, size=10000,
-    #                                             dtype=np.uint32)))  # fill state list with 'random' bits
-    #
-    #     codes_letters.append(code_letters)
-    #     codes.append(code)
-    #     states.append(state)
-
-    u_l = unique_letters[0].tolist()
-    for i in range(n_codes):
-        code_letters = np.pad(letters_harry_potter, pad_width=(0,  1000 - letters_harry_potter.shape[0]), mode='wrap')
-        code = [u_l.index(l) for l in code_letters]
-        state = list(map(int, np.random.randint(low=1 << 8, high=(1 << 16) - 1, size=10000,
-                                                dtype=np.uint32)))  # fill state list with 'random' bits
-
-        codes_letters.append(code_letters)
-        codes.append(code)
-        states.append(state)
+    for n_codes in range (10, 600, 10):
+        codes_letters = []
+        codes = []
+        states = []
 
 
-    codes = torch.tensor(codes)
+        u_l = unique_letters[0].tolist()
 
-    pmfs = torch.tensor(
-        [list(letter_probabilities.values()) for _ in range(codes.shape[1])])  # powtarzam to tyle razy jakoa jest długość sekwencji
 
-    vans = VectorizedANS(
-        pmfs=torch.tensor([
-            pmfs.numpy()  # tyle razy powtarzam ile mam sekwencji
-            for _ in
-            range(n_codes)
-        ]),
-        bits=33
-    )
 
-    state_b_t = states
+        for i in range(n_codes):
+            code_letters = np.pad(letters_harry_potter, pad_width=(0,  1000 - letters_harry_potter.shape[0]), mode='wrap')
+            code = [u_l.index(l) for l in code_letters]
+            state = list(map(int, np.random.randint(low=1 << 8, high=(1 << 16) - 1, size=10000,
+                                                    dtype=np.uint32)))  # fill state list with 'random' bits
 
-    from time import time
+            codes_letters.append(code_letters)
+            codes.append(code)
+            states.append(state)
 
-    s = time()
-    state_b_t = vans.batch_encode(state_b_t, codes)
-    state_b_t, dec = vans.batch_decode(state_b_t)
-    t = time()
 
-    print("vec", t - s)
-    assert codes.tolist() == dec.tolist()
+        codes = torch.tensor(codes)
 
-    ans = ANS(
-        pmfs=pmfs,
-        bits=33
-    )
+        pmfs = torch.tensor(
+            [list(letter_probabilities.values()) for _ in range(codes.shape[1])])  # powtarzam to tyle razy jakoa jest długość sekwencji
 
-    s = time()
+        vans = VectorizedANS(
+            pmfs=torch.tensor([
+                pmfs.numpy()  # tyle razy powtarzam ile mam sekwencji
+                for _ in
+                range(n_codes)
+            ]),
+            bits=33
+        )
 
-    state_b_t = ans.batch_encode(state_b_t, codes)
-    state_b_t, dec = ans.batch_decode(state_b_t)
-    t = time()
+        state_b_t = states
 
-    print("loop", t - s)
-    assert codes.tolist() == dec.tolist()
+        from time import time
+
+        s = time()
+        state_b_t = vans.batch_encode(state_b_t, codes)
+        state_b_t, dec = vans.batch_decode(state_b_t)
+        t = time()
+
+        print("vec", t - s)
+
+        vec_time_array.append(t - s)
+        assert codes.tolist() == dec.tolist()
+
+        ans = ANS(
+            pmfs=pmfs,
+            bits=33
+        )
+
+        s = time()
+
+
+        state_b_t = ans.batch_encode(state_b_t, codes)
+        state_b_t, dec = ans.batch_decode(state_b_t)
+        t = time()
+
+        loop_time_array.append(t - s)
+
+        print("loop", t - s)
+        assert codes.tolist() == dec.tolist()
+
+    data = pd.DataFrame({"vec" : vec_time_array, "loop": loop_time_array })
+    data.to_csv("data1.csv")
