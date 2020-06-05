@@ -8,12 +8,30 @@ import torch
 
 from time import time
 
-
 NORM_CONST = 31
+harry_potter = '''
+Harry turned to look at Ron and Hermione. Neither of them seemed to have
+understood what Xenophilius had said either.
+"The Deathly Hallows?"
+"That's right," said Xenophilius. "You haven't heard of them? I'm not surprised.
+Very, very few wizards believe. Witness that knuckle-headed young man at your
+brother's wedding," he nodded at Ron, "who attacked me for sporting the symbol of a
+well-known Dark wizard! Such ignorance. There is nothing Dark about the Hallows – at
+least not in that crude sense. One simply uses the symbol to reveal oneself to other
+believers, in the hope that they might help one with the Quest."
+He stirred several lumps of sugar into his Gurdyroot infusion and drank some.
+"I'm sorry," said Harry, "I still don't really understand."
+To be polite, he took a sip from his cup too, and almost gagged: The stuff was
+quite disgusting, as though someone had liquidized bogey-flavored Every Flavor Beans. '''
+
+
+
+
 # 31 bc we need to keep in int domain
 
 class ANS:
     """ANS - bitswap implementation"""
+
     def __init__(self, pmfs: torch.Tensor, bits: int = 31, quantbits: int = 8):
         init_s = time()
         self.device = pmfs.device
@@ -111,8 +129,11 @@ class VectorizedANS(ANS):
         init_s = time()
         if len(pmfs.shape) == 2:
             pmfs = pmfs.unsqueeze(0)
-            # pmfs should be of shape b_t_p
-
+            # pmfs should be of shape b_t_p powinien być trój wymiarowy
+            # p - prawdopodobieństwa dla elementów
+            # t - każdy kolejnyu element w sekwencji może mieć  (wektro prawdopodobieństw może być powtóżony wiele razy
+            # b - wielkość batach  dla uproszczenia możemy uznać ze ma takie samo prawdopodobieństwo
+            # ans
 
         # super().__init__(pmfs, bits, quantbits)
         self.device = pmfs.device
@@ -121,7 +142,6 @@ class VectorizedANS(ANS):
 
         # mask of 2**bits - 1 bits
         self.mask = (1 << bits) - 1
-
 
         # normalization constants
         self.lbound = 1 << NORM_CONST
@@ -142,7 +162,6 @@ class VectorizedANS(ANS):
 
         # print("mult", (t11 - t1), "add", (t2 - t11))
 
-
         for i in range(self.n_seqs):
             self.pmfs[
                 i, torch.arange(0, self.seq_len), torch.argmax(self.pmfs[i], dim=1)
@@ -153,19 +172,17 @@ class VectorizedANS(ANS):
         # print(self.cdfs.shape)
         self.cdfs = torch.cat(
             [
-                torch.zeros([self.n_seqs, self.cdfs.shape[1], 1], dtype=torch.long, device=self.device), 
+                torch.zeros([self.n_seqs, self.cdfs.shape[1], 1], dtype=torch.long, device=self.device),
                 self.cdfs
             ],
-        dim=2)  # pad with 0 at the beginning
+            dim=2)  # pad with 0 at the beginning
 
         assert self.pmfs.shape == (self.n_seqs, self.seq_len, self.support)
         assert self.cdfs.shape == (self.n_seqs, self.seq_len, self.support + 1)
         assert torch.all(self.cdfs[:, :, -1] == (1 << bits))
 
-        self.pmfs_t_b_p = self.pmfs.transpose(0,1)
-        self.cdfs_t_b_p = self.cdfs.transpose(0,1)
-
-
+        self.pmfs_t_b_p = self.pmfs.transpose(0, 1)
+        self.cdfs_t_b_p = self.cdfs.transpose(0, 1)
 
     def encode(self, stream: List[int], sequence: torch.Tensor):
         return self.batch_encode([stream], sequence.unsqueeze(0))[0]
@@ -182,14 +199,14 @@ class VectorizedANS(ANS):
         )
         b, t = symbols_b_t.shape
 
-        streams_tensor = torch.ones((b, t+1)).long().to(self.device) * -1
-        h_pointers = torch.zeros(b).long() # point at tops of the streams
-        v_pointers = torch.arange(b).long() 
+        streams_tensor = torch.ones((b, t + 1)).long().to(self.device) * -1
+        h_pointers = torch.zeros(b).long()  # point at tops of the streams
+        v_pointers = torch.arange(b).long()
         streams_tensor[v_pointers, h_pointers] = old_streams_tops
 
         for i, s in tqdm(enumerate(symbols_t_b), desc="batch encode"):
             pmf = self.pmfs_t_b_p[i, torch.arange(self.n_seqs), s]
-            cdf = self.cdfs_t_b_p[i, torch.arange(self.n_seqs), s]            
+            cdf = self.cdfs_t_b_p[i, torch.arange(self.n_seqs), s]
             overflows = old_streams_tops / pmf >= ((self.lbound >> self.bits) << NORM_CONST)
 
             new_streams_tops = torch.ones_like(old_streams_tops) * -1
@@ -209,44 +226,44 @@ class VectorizedANS(ANS):
         new_streams_b_t = streams_tensor.cpu().tolist()
         h_pointers = h_pointers.cpu().tolist()
         return [
-            stream[:-1] + new_stream[:h+1]
+            stream[:-1] + new_stream[:h + 1]
             for stream, new_stream, h in zip(streams_b_t, new_streams_b_t, h_pointers)
         ]
 
     def batch_decode(self, streams_b_t: List[List[int]]) -> Tuple[List[List[int]], torch.Tensor]:
         sequences = [[] for _ in streams_b_t]
         b = len(streams_b_t)
-        v_pointers = torch.arange(b).long() 
+        v_pointers = torch.arange(b).long()
         h_pointers = torch.tensor(
             [len(s) for s in streams_b_t]
-        ).long() - 1 # point at tops of the streams
+        ).long() - 1  # point at tops of the streams
 
         max_str_len = h_pointers.max() + 1
         stream_tensor = torch.ones((b, max_str_len)).long() * -1
         for i, stream in enumerate(streams_b_t):
             stream_tensor[i, :len(stream)] = torch.tensor(stream).long()
-        
+
         stream_tensor = stream_tensor.to(self.device)
         seq_tensor = torch.zeros((self.n_seqs, self.seq_len)).long().to(self.device)
-
 
         for i in tqdm(reversed(range(self.seq_len)), desc="batch decode"):
             old_streams_tops = stream_tensor[v_pointers, h_pointers]
             older_streams_tops = stream_tensor[v_pointers, h_pointers - 1]
             masked_streams_tops = old_streams_tops & self.mask
             symbols = torch.searchsorted(
-                self.cdfs_t_b_p[i][v_pointers, :-1], 
-                masked_streams_tops.unsqueeze(1), 
-                right=True,'
+                self.cdfs_t_b_p[i][v_pointers, :-1],
+                masked_streams_tops.unsqueeze(1),
+                right=True,
             ) - 1
 
             symbols = symbols.reshape(symbols.shape[0])
 
-            new_streams_tops = self.pmfs_t_b_p[i, v_pointers, symbols] * (old_streams_tops >> self.bits) + masked_streams_tops - self.cdfs_t_b_p[i, v_pointers, symbols]
+            new_streams_tops = self.pmfs_t_b_p[i, v_pointers, symbols] * (
+                        old_streams_tops >> self.bits) + masked_streams_tops - self.cdfs_t_b_p[i, v_pointers, symbols]
             underflows = new_streams_tops < self.lbound
 
             new_streams_tops[underflows] = (new_streams_tops[underflows] << NORM_CONST) | older_streams_tops[underflows]
-            
+
             stream_tensor[v_pointers, h_pointers] = -1
             h_pointers[underflows] -= 1
             stream_tensor[underflows, h_pointers[underflows]] = -1
@@ -256,20 +273,26 @@ class VectorizedANS(ANS):
         stream_tensor = stream_tensor.cpu().tolist()
         h_pointers = h_pointers.cpu().tolist()
         return [
-            stream[:h+1]
-            for (stream, h) in zip(stream_tensor, h_pointers)
-        ], seq_tensor
+                   stream[:h + 1]
+                   for (stream, h) in zip(stream_tensor, h_pointers)
+               ], seq_tensor
+
 
 if __name__ == '__main__':
-
 
     np.random.seed(0)
     base = 16
     total = 2 ** base
 
-    letters = ['A', 'B', 'C']
+    # letters = ['A', 'B', 'C']
+    # probabilities = [0.2, 0.3, 0.5]
 
-    probabilities = [0.2, 0.3, 0.5]
+    harry_potter = harry_potter.lower()
+    letters_harry_potter = np.array(list(harry_potter))
+    unique_letters = np.unique(letters_harry_potter, return_counts=True)
+
+    sum_of_all = sum(unique_letters[1])
+    letter_probabilities = {x: y / sum_of_all for x, y in zip(unique_letters[0], unique_letters[1])}
 
     # code_letters_1 = "BABCCCBABCCCAA"#np.random.choice(letters, 4, p=probabilities)
     n_letters = 1000
@@ -279,25 +302,37 @@ if __name__ == '__main__':
     codes = []
     states = []
 
+    # for i in range(n_codes):
+    #     code_letters = np.random.choice(letters, n_letters, p=probabilities).tolist()
+    #     code = [letters.index(l) for l in code_letters]
+    #     state = list(map(int, np.random.randint(low=1 << 8, high=(1 << 16) - 1, size=10000,
+    #                                             dtype=np.uint32)))  # fill state list with 'random' bits
+    #
+    #     codes_letters.append(code_letters)
+    #     codes.append(code)
+    #     states.append(state)
+
+    u_l = unique_letters[0].tolist()
     for i in range(n_codes):
-        code_letters = np.random.choice(letters, n_letters, p=probabilities).tolist()
-        code = [letters.index(l) for l in code_letters]
+        code_letters = np.pad(letters_harry_potter, pad_width=(0,  1000 - letters_harry_potter.shape[0]), mode='wrap')
+        code = [u_l.index(l) for l in code_letters]
         state = list(map(int, np.random.randint(low=1 << 8, high=(1 << 16) - 1, size=10000,
-                                              dtype=np.uint32)))  # fill state list with 'random' bits
+                                                dtype=np.uint32)))  # fill state list with 'random' bits
 
         codes_letters.append(code_letters)
         codes.append(code)
         states.append(state)
 
-    codes= torch.tensor(codes)
 
-    pmfs = torch.tensor([probabilities for _ in range(codes.shape[1])])
+    codes = torch.tensor(codes)
 
+    pmfs = torch.tensor(
+        [list(letter_probabilities.values()) for _ in range(codes.shape[1])])  # powtarzam to tyle razy jakoa jest długość sekwencji
 
     vans = VectorizedANS(
         pmfs=torch.tensor([
-            pmfs.numpy()
-            for _ in 
+            pmfs.numpy()  # tyle razy powtarzam ile mam sekwencji
+            for _ in
             range(n_codes)
         ]),
         bits=33
@@ -315,7 +350,6 @@ if __name__ == '__main__':
     print("vec", t - s)
     assert codes.tolist() == dec.tolist()
 
-
     ans = ANS(
         pmfs=pmfs,
         bits=33
@@ -328,6 +362,4 @@ if __name__ == '__main__':
     t = time()
 
     print("loop", t - s)
-
     assert codes.tolist() == dec.tolist()
-
