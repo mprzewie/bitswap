@@ -295,6 +295,9 @@ if __name__ == '__main__':
     n_codes = 100
     vec_time_array = []
     loop_time_array = []
+    device = torch.device("cuda:0")
+
+
 
     for n_codes in range (10, 600, 10):
         codes_letters = []
@@ -317,17 +320,17 @@ if __name__ == '__main__':
             states.append(state)
 
 
-        codes = torch.tensor(codes)
+        codes = torch.tensor(codes, device=device)
 
         pmfs = torch.tensor(
-            [list(letter_probabilities.values()) for _ in range(codes.shape[1])])  # powtarzam to tyle razy jakoa jest długość sekwencji
+            [list(letter_probabilities.values()) for _ in range(codes.shape[1])], device=device)  # powtarzam to tyle razy jakoa jest długość sekwencji
 
         vans = VectorizedANS(
             pmfs=torch.tensor([
                 pmfs.numpy()  # tyle razy powtarzam ile mam sekwencji
                 for _ in
                 range(n_codes)
-            ]),
+            ], device=device),
             bits=33
         )
 
