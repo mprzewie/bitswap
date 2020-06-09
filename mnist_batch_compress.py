@@ -21,6 +21,7 @@ def compress(quantbits, nz, bitswap, gpu):
     ansbits = NORM_CONST - 1 # ANS precision
     type = torch.float64 # datatype throughout compression
     device = "cuda:0" #f"cuda:{gpu}" # gpu
+    ans_device = device #"cuda:0"
 
     # set up the different channel dimension for different latent depths
     if nz == 8:
@@ -87,6 +88,7 @@ def compress(quantbits, nz, bitswap, gpu):
     test_set = datasets.MNIST(root="model/data/mnist", train=False, transform=transform_ops, download=True)
 
     # sample (experiments, ndatapoints) from test set with replacement
+    print(len(test_set.data))
     if not os.path.exists("bitstreams/mnist/indices"):
         randindices = np.random.choice(len(test_set.data), size=(experiments, ndatapoints), replace=False)
         np.save("bitstreams/mnist/indices", randindices)
@@ -113,7 +115,7 @@ def compress(quantbits, nz, bitswap, gpu):
         # < ===== COMPRESSION ===>
         # initialize compression
         model.compress()
-        state = list(map(int, np.random.randint(low=1 << 16, high=(1 << NORM_CONST) - 1, size=10000, dtype=np.uint32))) # fill state list with 'random' bits
+        state = list(map(int, np.random.randint(low=1 << 16, high=(1 << NORM_CONST) - 1, size=(128), dtype=np.uint32))) # fill state list with 'random' bits
         state[-1] = state[-1] << 16 #NORM_CONST
         
         states = [
@@ -164,13 +166,13 @@ def compress(quantbits, nz, bitswap, gpu):
             ), dim=2)
                 
             ans = ANS(
-                pmfs_b,
+                pmfs_b.to(ans_device),
                 bits=ansbits, quantbits=quantbits
             )
             t1 = time.time()
             states, zsymtops = ans.batch_decode(states)
             t2 = time.time()
-
+            zsymtops = zsymtops.to(device)
 
             if zi == 0:
                 reststates = states.copy()
@@ -205,7 +207,7 @@ def compress(quantbits, nz, bitswap, gpu):
             ), dim=2)
             
             ans = ANS(
-                pmfs_b,
+                pmfs_b.to(ans_device),
                 bits=ansbits, quantbits=quantbits
             )
 
@@ -221,7 +223,7 @@ def compress(quantbits, nz, bitswap, gpu):
             torch.stack([
                 prior_pmfs
                 for _ in range(len(datapoints))
-            ]), 
+            ]).to(ans_device), 
             bits=ansbits, quantbits=quantbits
         ).batch_encode(states, zsymtops)
         
@@ -268,6 +270,12 @@ def compress(quantbits, nz, bitswap, gpu):
         # open state file
         with open(state_file, "rb") as fp:
             states = pickle.load(fp)
+        
+        print([len(s) for s in states])
+        print(sum([
+            len(s) - len(inits)
+            for (s, inits) in zip(states, initialstates)
+        ]))
 
         # <===== RECEIVER =====>
 
@@ -276,9 +284,10 @@ def compress(quantbits, nz, bitswap, gpu):
             torch.stack([
                 prior_pmfs
                 for _ in range(len(datapoints))
-            ]), 
+            ]).to(ans_device), 
             bits=ansbits, quantbits=quantbits
         ).batch_decode(states)
+        zsymtops = zsymtops.to(device)
 
         for zi in reversed(range(nz)):
             zs = z = zcentres[zi, zrange, zsymtops]
@@ -308,11 +317,12 @@ def compress(quantbits, nz, bitswap, gpu):
             ), dim=2)
             
             ans = ANS(
-                pmfs_b,
+                pmfs_b.to(ans_device),
                 bits=ansbits, quantbits=quantbits
             )
             
             states, symbols = ans.batch_decode(states)
+            symbols = symbols.to(device)
 
             inputs = zcentres[zi - 1, zrange, symbols] if zi > 0 else xcentres[xrange, symbols]
 
@@ -339,7 +349,7 @@ def compress(quantbits, nz, bitswap, gpu):
             ), dim=2)
 
             ans = ANS(
-                pmfs_b,
+                pmfs_b.to(ans_device),
                 bits=ansbits, quantbits=quantbits
             )
 
@@ -347,7 +357,7 @@ def compress(quantbits, nz, bitswap, gpu):
             zsymtops = symbols
 
         assert all([
-            torch.all(datapoints[xi][0].view(xdim).long().to(device) == zsymtops[xi])
+            torch.all(datapoints[xi][0].view(xdim).long().to(device) == zsymtops[xi].to(device))
             for xi in range(len(datapoints))
         ])
 

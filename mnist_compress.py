@@ -45,6 +45,7 @@ def compress(quantbits, nz, bitswap, gpu):
     # compression experiment params
     experiments = 10
     ndatapoints = 100
+
     decompress = True
 
     # <=== MODEL ===>
@@ -101,7 +102,7 @@ def compress(quantbits, nz, bitswap, gpu):
         # < ===== COMPRESSION ===>
         # initialize compression
         model.compress()
-        state = list(map(int, np.random.randint(low=1 << 16, high=(1 << NORM_CONST) - 1, size=10000, dtype=np.uint32))) # fill state list with 'random' bits
+        state = list(map(int, np.random.randint(low=1 << 16, high=(1 << NORM_CONST) - 1, size=114, dtype=np.uint32))) # fill state list with 'random' bits
         state[-1] = state[-1] << 16 #NORM_CONST
         initialstate = state.copy()
         restbits = None
@@ -230,6 +231,7 @@ def compress(quantbits, nz, bitswap, gpu):
         with open(f"bitstreams/mnist/nz{nz}/{'Bit-Swap' if bitswap else 'BB-ANS'}/{'Bit-Swap' if bitswap else 'BB-ANS'}_{quantbits}bits_nz{nz}_experiment{ei + 1}", "rb") as fp:
             state = pickle.load(fp)
 
+        print(len(state))
         if not decompress:
             continue
 
