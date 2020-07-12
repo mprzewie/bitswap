@@ -20,7 +20,7 @@ def compress(quantbits, nz, bitswap, gpu):
     xrange = torch.arange(xdim)
     ansbits = NORM_CONST - 1 # ANS precision
     type = torch.float64 # datatype throughout compression
-    device = "cuda:0" #f"cuda:{gpu}" # gpu
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     ans_device = device #"cuda:0"
 
     # set up the different channel dimension for different latent depths
@@ -45,7 +45,7 @@ def compress(quantbits, nz, bitswap, gpu):
     torch.backends.cudnn.benchmark = True
 
     # compression experiment params
-    experiments = 10
+    experiments = 20
     ndatapoints = 100
     decompress = True
 
@@ -115,7 +115,7 @@ def compress(quantbits, nz, bitswap, gpu):
         # < ===== COMPRESSION ===>
         # initialize compression
         model.compress()
-        state = list(map(int, np.random.randint(low=1 << 16, high=(1 << NORM_CONST) - 1, size=(128), dtype=np.uint32))) # fill state list with 'random' bits
+        state = list(map(int, np.random.randint(low=1 << 16, high=(1 << NORM_CONST) - 1, size=(200), dtype=np.uint32))) # fill state list with 'random' bits
         state[-1] = state[-1] << 16 #NORM_CONST
         
         states = [
@@ -263,13 +263,36 @@ def compress(quantbits, nz, bitswap, gpu):
         state_file = f"bitstreams/mnist/nz{nz}/{'Bit-Swap' if bitswap else 'BB-ANS'}/{'Bit-Swap' if bitswap else 'BB-ANS'}_{quantbits}bits_nz{nz}_experiment{ei + 1}_batch"
         print(state_file)
         # write state to file
+        # print(len(states))
+        # print([len(s) for s in states])
+
+        max_common_len = min([len(s) for s in states])
+        common_len = 0
+    
+        for pref in range(max_common_len):
+            if len(set(s[pref] for s in states)) > 1:
+                break
+            common_len = pref + 1
+
+        print("common len:", common_len)
+        states_to_dump = (
+            states[0][:common_len],
+            [
+                s[common_len:]
+                for s in states
+            ]
+        )
         with open(state_file, "wb") as fp:
-            pickle.dump(states, fp)
+            pickle.dump(states_to_dump, fp)
 
         state = None
         # open state file
         with open(state_file, "rb") as fp:
-            states = pickle.load(fp)
+            states_prefix, states_postfixes = pickle.load(fp)
+            states = [
+                states_prefix + sp 
+                for sp in states_postfixes
+            ]
         
         print([len(s) for s in states])
         print(sum([

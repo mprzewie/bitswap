@@ -43,7 +43,7 @@ def compress(quantbits, nz, bitswap, gpu):
     torch.backends.cudnn.benchmark = True
 
     # compression experiment params
-    experiments = 10
+    experiments = 20
     ndatapoints = 100
 
     decompress = True
@@ -102,7 +102,7 @@ def compress(quantbits, nz, bitswap, gpu):
         # < ===== COMPRESSION ===>
         # initialize compression
         model.compress()
-        state = list(map(int, np.random.randint(low=1 << 16, high=(1 << NORM_CONST) - 1, size=114, dtype=np.uint32))) # fill state list with 'random' bits
+        state = list(map(int, np.random.randint(low=1 << 16, high=(1 << NORM_CONST) - 1, size=200, dtype=np.uint32))) # fill state list with 'random' bits
         state[-1] = state[-1] << 16 #NORM_CONST
         initialstate = state.copy()
         restbits = None
